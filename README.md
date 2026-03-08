@@ -26,8 +26,12 @@ The model's performance is validated using a comprehensive suite of metrics:
 *   **Regression Metrics**: MSE, MAE, and $R^2$ Score.
 *   **Geometric Similarity**: Hausdorff distance, Chamfer distance, and IoU (Intersection over Union).
 
+<img src="E:\kan_ice\result\plots\radar_chart.png" alt="radar_chart" style="zoom:60%;" />
+
 ## Results
 The model demonstrates exceptional performance in icing profile prediction. Prediction curves show high fidelity to the ground truth across diverse operational scenarios, confirming that KAN is a robust and efficient choice for complex geometric regression tasks.
+
+<img src="E:\kan_ice\example.png" alt="example" style="zoom: 20%;" />
 
 ## Getting Started
 
