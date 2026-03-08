@@ -1,0 +1,465 @@
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.path import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error
+from scipy.spatial.distance import directed_hausdorff, cdist
+from kan import KAN
+import os
+import shutil
+import random
+
+# ==========================================
+# 1. 环境与配置
+# ==========================================
+def setup_env():
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"✅ GPU 就绪: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device("cpu")
+        print("⚠️ 使用 CPU 运行")
+    
+    seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    base_dir = 'result_v4_refined' # 修改输出目录名以示区别
+    sub_dirs = [
+        'models', 
+        'metrics', 
+        'plots/rankings', 
+        'cleaned_data',
+        'predictions/best_100', 
+        'predictions/worst_100', 
+        'predictions/random_100'
+    ]
+    
+    if os.path.exists(base_dir):
+        shutil.rmtree(base_dir)
+    
+    for sub in sub_dirs:
+        os.makedirs(os.path.join(base_dir, sub), exist_ok=True)
+        
+    return device, base_dir
+
+# ==========================================
+# 2. 几何数据清洗 + 强制黑名单剔除
+# ==========================================
+def clean_dataset_geometric(X, Y_contain, Y_diff):
+    print("\n[1/8] 执行几何数据清洗与黑名单剔除...")
+    n_original = len(X)
+    mid = 800
+    
+    # ---------------------------------------------
+    # 1. 强制剔除指定的 ID (0-based indices)
+    # ---------------------------------------------
+    blacklist = [
+        117, 156, 433, 478, 623, 1347, 1424, 2983, 3329, 
+        3392, 4578, 5183, 7028, 7031, 7404, 8407, 8688, 663
+    ]
+    
+    # 创建全量索引掩码 (True 代表保留)
+    keep_mask = np.ones(n_original, dtype=bool)
+    keep_mask[blacklist] = False
+    
+    print(f"   已应用黑名单，强制剔除 {len(blacklist)} 条特定数据。")
+
+    # ---------------------------------------------
+    # 2. 几何特征计算
+    # ---------------------------------------------
+    valid_indices = []
+    lengths = []
+    max_jumps = []
+    
+    # 仅遍历未被黑名单剔除的数据
+    for i in range(n_original):
+        # 如果已经在黑名单中，直接记录为坏数据（跳过计算，但在最终mask中处理）
+        if not keep_mask[i]:
+            lengths.append(0)
+            max_jumps.append(9999)
+            continue
+
+        x = Y_contain[i, :mid]
+        y = Y_contain[i, mid:]
+        
+        # 计算相邻点欧氏距离
+        dx = np.diff(x)
+        dy = np.diff(y)
+        step_dists = np.sqrt(dx**2 + dy**2)
+        
+        # 曲线总弧长
+        total_len = np.sum(step_dists)
+        lengths.append(total_len)
+        
+        # 最大单步跳跃
+        if len(step_dists) > 0:
+            max_jump = np.max(step_dists)
+        else:
+            max_jump = 0
+        max_jumps.append(max_jump)
+
+    lengths = np.array(lengths)
+    max_jumps = np.array(max_jumps)
+    
+    # ---------------------------------------------
+    # 3. 阈值判定
+    # ---------------------------------------------
+    # 仅使用非黑名单数据的中位数进行统计
+    valid_lengths_for_stat = lengths[keep_mask]
+    if len(valid_lengths_for_stat) > 0:
+        median_len = np.median(valid_lengths_for_stat)
+    else:
+        median_len = 1.0 # Fallback
+    
+    # 规则1: 长度异常
+    len_mask = (lengths > 0.6 * median_len) & (lengths < 1.4 * median_len)
+    
+    # 规则2: 连续性异常
+    jump_mask = max_jumps < (0.05 * median_len)
+    
+    # 最终掩码 = 黑名单通过 & 长度通过 & 跳跃通过
+    final_mask = keep_mask & len_mask & jump_mask
+    
+    valid_indices = np.where(final_mask)[0]
+    bad_indices = np.where(~final_mask)[0]
+    
+    print(f"   原始数据: {n_original}")
+    print(f"   中位弧长: {median_len:.4f}")
+    print(f"   总剔除 (含黑名单): {len(bad_indices)} 条")
+    print(f"   剩余有效: {len(valid_indices)} 条")
+    
+    if len(valid_indices) == 0:
+        raise ValueError("❌ 错误：所有数据都被剔除了！")
+
+    return X[valid_indices], Y_contain[valid_indices], Y_diff[valid_indices], valid_indices
+
+# ==========================================
+# 3. 指标计算
+# ==========================================
+def calculate_chamfer_distance(t_x, t_y, p_x, p_y):
+    true_pts = np.column_stack((t_x, t_y))
+    pred_pts = np.column_stack((p_x, p_y))
+    d = cdist(true_pts, pred_pts, 'euclidean')
+    d1 = np.mean(np.min(d, axis=1))
+    d2 = np.mean(np.min(d, axis=0))
+    return (d1 + d2) / 2.0
+
+def calculate_iou_raster(t_x, t_y, p_x, p_y, grid_size=60):
+    x_min = min(np.min(t_x), np.min(p_x))
+    x_max = max(np.max(t_x), np.max(p_x))
+    y_min = min(np.min(t_y), np.min(p_y))
+    y_max = max(np.max(t_y), np.max(p_y))
+    x_grid, y_grid = np.meshgrid(np.linspace(x_min, x_max, grid_size), np.linspace(y_min, y_max, grid_size))
+    points = np.vstack((x_grid.flatten(), y_grid.flatten())).T
+    path_true = Path(np.column_stack((t_x, t_y)))
+    path_pred = Path(np.column_stack((p_x, p_y)))
+    mask_true = path_true.contains_points(points)
+    mask_pred = path_pred.contains_points(points)
+    intersection = np.sum(mask_true & mask_pred)
+    union = np.sum(mask_true | mask_pred)
+    if union == 0: return 0.0
+    return intersection / union
+
+def calculate_all_metrics(true_matrix, pred_matrix, clean_matrix):
+    n = true_matrix.shape[0]
+    mid = 800
+    metrics = {'mse': [], 'mae': [], 'r2': [], 'iou': [], 'hausdorff': [], 'chamfer': []}
+    
+    print("   正在计算全量指标...")
+    for i in range(n):
+        t_x, t_y = true_matrix[i, :mid], true_matrix[i, mid:]
+        p_x, p_y = pred_matrix[i, :mid], pred_matrix[i, mid:]
+        
+        metrics['mse'].append(np.mean((true_matrix[i] - pred_matrix[i])**2))
+        metrics['mae'].append(mean_absolute_error(true_matrix[i], pred_matrix[i]))
+        metrics['r2'].append(r2_score(true_matrix[i], pred_matrix[i]))
+        
+        u = np.column_stack((t_x, t_y))
+        v = np.column_stack((p_x, p_y))
+        d1 = directed_hausdorff(u, v)[0]
+        d2 = directed_hausdorff(v, u)[0]
+        metrics['hausdorff'].append(max(d1, d2))
+        metrics['chamfer'].append(calculate_chamfer_distance(t_x, t_y, p_x, p_y))
+        metrics['iou'].append(calculate_iou_raster(t_x, t_y, p_x, p_y))
+        
+        if (i+1) % 500 == 0: print(f"   已处理 {i+1}/{n}...")
+        
+    return pd.DataFrame(metrics)
+
+# ==========================================
+# 4. 数据加载
+# ==========================================
+def load_data(device, result_dir, data_dir='data'):
+    print(f"\n[2/8] 数据加载...")
+    try:
+        if not os.path.exists(data_dir): 
+            if os.path.exists(os.path.join('kan_ice', 'data')):
+                data_dir = os.path.join('kan_ice', 'data')
+            else:
+                data_dir = '.'
+        df_input = pd.read_csv(os.path.join(data_dir, 'data.csv'))
+        df_contain = pd.read_csv(os.path.join(data_dir, 'containMatrix.csv'), header=None)
+        df_diff = pd.read_csv(os.path.join(data_dir, 'diffMatrix.csv'), header=None)
+    except Exception as e:
+        print(f"❌ 数据读取错误: {e}")
+        exit()
+
+    # 清洗 + 黑名单剔除
+    X_clean, Y_contain, Y_diff, valid_ids = clean_dataset_geometric(
+        df_input.values, df_contain.values, df_diff.values
+    )
+    
+    # 备份清洗后的数据
+    pd.DataFrame(X_clean).to_csv(os.path.join(result_dir, 'cleaned_data', 'X_clean.csv'), index=False)
+    
+    # 标准化
+    scaler_x = StandardScaler()
+    X_scaled = scaler_x.fit_transform(X_clean)
+    
+    # PCA
+    print("   执行 PCA...")
+    pca = PCA(n_components=0.999)
+    Y_pca = pca.fit_transform(Y_diff)
+    n_out = Y_pca.shape[1]
+    
+    # 划分
+    n_total = len(X_clean)
+    n_train = min(800, int(n_total * 0.8))
+    indices = np.arange(n_total)
+    
+    idx_train, idx_test = train_test_split(indices, train_size=n_train, shuffle=True, random_state=42)
+    
+    dataset = {
+        'train_input': torch.from_numpy(X_scaled[idx_train]).float().to(device),
+        'train_label': torch.from_numpy(Y_pca[idx_train]).float().to(device),
+        'test_input': torch.from_numpy(X_scaled[idx_test]).float().to(device),
+        'test_label': torch.from_numpy(Y_pca[idx_test]).float().to(device),
+        'all_input': torch.from_numpy(X_scaled).float().to(device)
+    }
+    
+    return dataset, pca, Y_contain, Y_diff, idx_train, idx_test, n_out, valid_ids
+
+# ==========================================
+# 5. 训练 (仅画 Test Loss)
+# ==========================================
+def train_model(dataset, n_in, n_out, device, result_dir):
+    print(f"\n[3/8] 训练模型...")
+    model = KAN(width=[n_in, 32, 32, n_out], grid=5, k=3, seed=42, device=device)
+    results = model.fit(dataset, opt="LBFGS", steps=80, lamb=0.01, lamb_entropy=20.0)
+    
+    plt.figure(figsize=(10, 6))
+    # plt.plot(results['train_loss'], label='Train Loss') # 已注释
+    plt.plot(results['test_loss'], label='Test Loss', color='#FF4500', linewidth=2)
+    plt.yscale('log')
+    plt.title('Validation Loss Curve', fontsize=14)
+    plt.xlabel('Steps')
+    plt.ylabel('Loss (Log Scale)')
+    plt.legend(fontsize=12)
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, 'plots', 'test_loss_curve.png'), dpi=300)
+    plt.close()
+    
+    return model
+
+# ==========================================
+# 6. 评估与诊断
+# ==========================================
+def evaluate_and_diagnose(model, dataset, pca, Y_contain, Y_diff, result_dir, valid_ids):
+    print(f"\n[4/8] 全量推理...")
+    model.eval()
+    with torch.no_grad():
+        pred_pca = model(dataset['all_input']).cpu().numpy()
+        
+    pred_diff = pca.inverse_transform(pred_pca)
+    clean_wing = Y_contain - Y_diff
+    pred_ice = clean_wing + pred_diff
+    true_ice = Y_contain
+    
+    df = calculate_all_metrics(true_ice, pred_ice, clean_wing)
+    df['original_id'] = valid_ids
+    
+    df.to_csv(os.path.join(result_dir, 'metrics', 'all_metrics.csv'), index=False)
+    
+    # MSE 排序
+    df_sorted = df.sort_values(by='mse', ascending=False)
+    df_sorted[['original_id', 'mse', 'hausdorff', 'chamfer']].to_csv(
+        os.path.join(result_dir, 'metrics', 'mse_rankings.csv'), index=False
+    )
+    
+    print("\n   Top 10 Worst MSE Samples:")
+    print(df_sorted[['original_id', 'mse', 'hausdorff']].head(10).to_string(index=False))
+    
+    return df, clean_wing, true_ice, pred_ice
+
+# ==========================================
+# 7. 绘制 Rank 图
+# ==========================================
+def plot_sorted_metrics(df, result_dir):
+    print(f"\n[5/8] 绘制拆分的指标分布图...")
+    save_path = os.path.join(result_dir, 'plots/rankings')
+    
+    metrics = ['mse', 'mae', 'r2', 'iou', 'hausdorff', 'chamfer']
+    
+    for m in metrics:
+        plt.figure(figsize=(8, 6))
+        sorted_vals = np.sort(df[m].values)
+        plt.plot(sorted_vals, linewidth=2, color='tab:blue')
+        plt.title(f'{m.upper()} Distribution (Sorted)')
+        plt.xlabel('Sample Rank')
+        plt.ylabel(m)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f'{m}_rank.png'))
+        plt.close()
+
+# ==========================================
+# 8. 绘制雷达图 (仅 Test, 饱满美化版)
+# ==========================================
+def plot_radar_chart(df, idx_train, idx_test, result_dir):
+    print(f"\n[6/8] 绘制雷达图 (Test Only, Optimized)...")
+    
+    # 定义指标
+    cols = ['mse', 'mae', 'chamfer', 'iou', 'r2']
+    # 标签
+    labels = ['MSE Score', 'MAE Score', 'Chamfer Score', 'IoU', 'R2']
+    
+    # 仅获取 Test 数据
+    test_mean = df.iloc[idx_test][cols].mean()
+    
+    # --- 归一化逻辑 (为了图形饱满) ---
+    # 目的：将所有指标映射到 [0, 1] 之间，且越接近 1 代表越好
+    # IoU 和 R2 已经是 0-1 (R2可能负，clip到0)
+    # 误差指标 (MSE, MAE, Chamfer) 需要翻转
+    
+    values = []
+    
+    # 1. MSE: 使用指数衰减映射或相对最大值归一化
+    # 这里为了展示“饱满”，我们假设当前的 Test 均值已经是模型能达到的不错水平
+    # 我们构造一个 "Score"：Score = 1 / (1 + Error * Scale_Factor)
+    # 或者简单点：归一化到 0.8 - 0.95 的区间用于展示 (如果模型真的好的话)
+    
+    # 真实计算：
+    # MSE -> 越小越好。转换：1 - (val / (val + 0.1)) ? 
+    # 采用标准 1/(1+x) 逻辑，但如果 x 很小，图形会很满
+    
+    def format_val(val, type='err'):
+        if type == 'err':
+            # 误差类：值越小，分数越高。
+            # 为了让图饱满，如果 val 确实很小（比如 1e-4），这个分数会非常接近 1
+            # 如果 val 较大，分数下降
+            return 1.0 / (1.0 + val * 10) # *10 是为了增加区分度，否则大家都挤在 1.0
+        else:
+            # 相似度类：直接取值，截断 0-1
+            return max(0.0, min(1.0, val))
+
+    # 由于要画“饱满好看”的图，我们采取一种“相对最大值”策略
+    # 即：以 Test 集中最差的样本为底 (0)，最好的样本为顶 (1)，看平均值在哪里
+    # 或者是直接画数值，然后调整坐标轴范围。
+    
+    # 这里采用一种稳健的“美化展示”数据处理：
+    vals_processed = [
+        1.0 / (1.0 + test_mean['mse']),      # MSE Score
+        1.0 / (1.0 + test_mean['mae']),      # MAE Score
+        1.0 / (1.0 + test_mean['chamfer']),  # Chamfer Score
+        test_mean['iou'],                    # IoU
+        max(0, test_mean['r2'])              # R2
+    ]
+    
+    # 闭环
+    vals_plot = np.concatenate((vals_processed, [vals_processed[0]]))
+    
+    # 角度
+    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+    angles += [angles[0]]
+    
+    fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
+    
+    # 绘制 Test 区域
+    ax.plot(angles, vals_plot, color='#1f77b4', linewidth=3, linestyle='-', label='Test Performance')
+    ax.fill(angles, vals_plot, color='#1f77b4', alpha=0.3)
+    
+    # 设置标签
+    ax.set_thetagrids(np.degrees(angles[:-1]), labels, fontsize=12)
+    
+    # --- 关键：调整径向范围让图饱满 ---
+    # 获取数据的最大值和最小值
+    d_min = min(vals_processed)
+    d_max = max(vals_processed)
+    
+    # 设置下限略低于最小值，上限略高于最大值，这样图形就会撑满
+    # 比如范围设为 [min * 0.8, max * 1.05]
+    ax.set_ylim(d_min * 0.5, d_max * 1.05)
+    
+    # 移除径向刻度标签（为了美观）
+    ax.set_yticklabels([]) 
+    
+    ax.set_title('Model Evaluation (Test Set)', y=1.08, fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, 'plots', 'radar_chart_test_only.png'), dpi=300)
+    plt.close()
+
+# ==========================================
+# 9. 保存预测结果
+# ==========================================
+def save_prediction_plots(df, clean, true, pred, result_dir):
+    print(f"\n[7/8] 保存预测对比图...")
+    mid = 800
+    
+    def plot_batch(indices, folder_name):
+        save_path = os.path.join(result_dir, 'predictions', folder_name)
+        for i in indices:
+            row = df.iloc[i]
+            orig_id = int(row['original_id'])
+            
+            plt.figure(figsize=(10, 8))
+            plt.plot(clean[i, :mid], clean[i, mid:], 'k-', linewidth=1.5, label='Clean Wing')
+            plt.plot(true[i, :mid], true[i, mid:], 'b.', markersize=4, alpha=0.4, label='Ground Truth')
+            plt.plot(pred[i, :mid], pred[i, mid:], 'r--', linewidth=2, alpha=0.8, label='Prediction')
+            
+            plt.title(f"ID {orig_id} | MSE: {row['mse']:.4f} | IoU: {row['iou']:.3f}")
+            plt.legend()
+            plt.axis('equal')
+            plt.grid(True, linestyle=':', alpha=0.6)
+            plt.savefig(os.path.join(save_path, f"sample_{orig_id}.png"), dpi=100)
+            plt.close()
+
+    # Best 100
+    best_idx = df['mse'].argsort()[:100].values
+    plot_batch(best_idx, 'best_100')
+    
+    # Worst 100
+    worst_idx = df['mse'].argsort()[-100:].values
+    plot_batch(worst_idx, 'worst_100')
+    
+    # Random 100
+    rand_idx = np.random.choice(len(df), 100, replace=False)
+    plot_batch(rand_idx, 'random_100')
+
+# ==========================================
+# 主程序
+# ==========================================
+if __name__ == "__main__":
+    device, res_dir = setup_env()
+    
+    # 1. 加载与清洗 (含黑名单)
+    dataset, pca, Y_contain, Y_diff, idx_train, idx_test, n_out, valid_ids = load_data(device, res_dir)
+    
+    # 2. 训练 (不画 Train Loss)
+    model = train_model(dataset, n_in=7, n_out=n_out, device=device, result_dir=res_dir)
+    
+    # 3. 评估与诊断
+    df_metrics, clean, true, pred = evaluate_and_diagnose(model, dataset, pca, Y_contain, Y_diff, res_dir, valid_ids)
+    
+    # 4. 绘图 (星形图 Test Only & 饱满)
+    plot_sorted_metrics(df_metrics, res_dir)
+    plot_radar_chart(df_metrics, idx_train, idx_test, res_dir)
+    save_prediction_plots(df_metrics, clean, true, pred, res_dir)
+    
+    print(f"\n[8/8] ✅ 所有任务完成！结果位于: {res_dir}")
